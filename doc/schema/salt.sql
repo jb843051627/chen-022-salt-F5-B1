@@ -122,11 +122,11 @@ CREATE TABLE IF NOT EXISTS t_salt_link_page (
   id bigint NOT NULL COMMENT '主键',
   bill_no varchar(64) DEFAULT NULL COMMENT '企业品种挂接代号',
   node_no int DEFAULT NULL COMMENT '适用区域层级序',
-  site_id int DEFAULT NULL COMMENT '所属定点企业',
+  site_id bigint DEFAULT NULL COMMENT '所属定点企业（与 t_salt_ent.id 同型 bigint，勿用 int 截断，否则列表与详情对到另一张证）',
   site_no varchar(64) DEFAULT NULL COMMENT '所属企业代号',
   should_count int DEFAULT NULL COMMENT '应挂品种数',
   done_count int DEFAULT NULL COMMENT '已挂品种数',
-  lack_count int DEFAULT NULL COMMENT '欠挂品种数',
+  lack_count int DEFAULT NULL COMMENT '欠挂品种数（结存，同源 = max(应挂-已挂,0)，外填不认）',
   content varchar(255) DEFAULT NULL COMMENT '随页交来的标签要件',
   status int DEFAULT NULL COMMENT '挂接进展 0待挂 1已挂讫 2压页',
   del_flag int DEFAULT '0' COMMENT '删除标记 0正常 1删除',
@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS t_salt_year_task (
   site_id bigint DEFAULT NULL COMMENT '拴着哪家企业(t_salt_ent.id)',
   biz_type int DEFAULT '0' COMMENT '事由 0年检催办 1换证提醒',
   due_at datetime DEFAULT NULL COMMENT '应开口那一日的止点时刻',
-  amount decimal(12,2) DEFAULT NULL COMMENT '最可提前几日开口（按工作日数）',
+  amount decimal(12,2) DEFAULT NULL COMMENT '最可提前几日开口（按工作日数；建条当刻定版写入，默认3个工作日，跑轮只认行内这一版，不随常规改版重算）',
   script_no varchar(64) DEFAULT NULL COMMENT '照哪一份话本去发(t_salt_notify_script.script_no)',
   content varchar(255) DEFAULT NULL COMMENT '事由与所对企业的记要',
   status int DEFAULT NULL COMMENT '条目情形 0待派 1已派出 2分不出',
@@ -208,7 +208,9 @@ CREATE TABLE IF NOT EXISTS t_salt_year_task (
   update_time datetime DEFAULT NULL COMMENT '更新时间',
   remark varchar(500) DEFAULT NULL COMMENT '备注',
   PRIMARY KEY (id),
-  KEY idx_salt_year_task_status_due (status, due_at)
+  KEY idx_salt_year_task_status_due (status, due_at),
+  -- 同一批并着建两回幂等：同企业+事由+止点只落一条（createManual 先查后插，此键兜并发）
+  UNIQUE KEY uk_salt_year_task_batch (site_id, biz_type, due_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='年检到期催办单';
 
 -- 初始档案数据（状态约定：id=1 启用 / id=2 停用）

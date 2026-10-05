@@ -18,6 +18,8 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.format.annotation.DateTimeFormat;
+import com.fc.v2.model.auto.TSaltYearTask;
 
 /**
  * 年检到期催办单 Controller（scheduling-job 形状：现行屏 + 跑一轮入口）。
@@ -62,5 +64,28 @@ public class SaltYearTaskController extends BaseController {
         SaltYearRoundResult round = saltYearTaskService.runRound(new Date());
         // 屏上三个数、逐条痕迹、四样回话全部取自这一趟出口，不另查屏、不手填
         return AjaxResult.success(200, round.getMessage(), round);
+    }
+
+    @Log(title = "年检催办手工建条", action = "add")
+    @ApiOperation(value = "开一条催办", notes = "年检岗手工建：名录联动、默认提前3工作日定版、同企业+事由+止点幂等")
+    @PostMapping("/add")
+    @RequiresPermissions("saltYearTask:add")
+    @ResponseBody
+    public AjaxResult add(
+            @org.springframework.web.bind.annotation.RequestParam("siteId") Long siteId,
+            @org.springframework.web.bind.annotation.RequestParam(value = "bizType", required = false) Integer bizType,
+            @org.springframework.web.bind.annotation.RequestParam("dueAt")
+            @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss") Date dueAt,
+            @org.springframework.web.bind.annotation.RequestParam(value = "leadWorkdays", required = false)
+            Integer leadWorkdays,
+            @org.springframework.web.bind.annotation.RequestParam("scriptNo") String scriptNo,
+            @org.springframework.web.bind.annotation.RequestParam(value = "content", required = false) String content) {
+        TSaltYearTask saved = saltYearTaskService.createManual(siteId, bizType, dueAt,
+                leadWorkdays, scriptNo, content);
+        if (saved == null) {
+            // 联动/话本/止点校验不过：名录摘牌或查无、话本缺失停用、止点空着，均不开条
+            return AjaxResult.error("建条未成：企业已摘牌或查无名录、话本缺失/停用/事由不对，或止点未填");
+        }
+        return AjaxResult.success(200, "已开催办条目", saved);
     }
 }

@@ -44,7 +44,7 @@ public class TSaltLinkPage implements Serializable {
     /** 所属定点企业 */
     @TableField("site_id")
     @ApiModelProperty(value = "所属定点企业")
-    private Integer siteId;
+    private Long siteId;
 
     /** 所属企业代号 */
     @TableField("site_no")
@@ -132,11 +132,11 @@ public class TSaltLinkPage implements Serializable {
         this.nodeNo = nodeNo;
     }
 
-    public Integer getSiteId() {
+    public Long getSiteId() {
         return siteId;
     }
 
-    public void setSiteId(Integer siteId) {
+    public void setSiteId(Long siteId) {
         this.siteId = siteId;
     }
 

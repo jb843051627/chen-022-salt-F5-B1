@@ -1,5 +1,6 @@
 package com.fc.v2.service.impl;
 
+import java.math.BigDecimal;
 import java.text.SimpleDateFormat;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -54,12 +55,15 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
     private static final int OFFICER_ON = 0;
     private static final int SCRIPT_ON = 0;
 
-    /** 分不出原委码：日后按原委挑得出一批 */
-    static final String REASON_DELISTED = "企业已从名录摘走";
-    static final String REASON_CONTACT_EMPTY = "联络人栏空缺多季未补";
-    static final String REASON_SCRIPT = "话本缺失或已停用，无本可依";
-    static final String REASON_QUOTA_FULL = "执法员当日接活定额已满";
-    static final String REASON_NO_OFFICER = "无在岗且接得动该事由的执法员";
+    /** 手动建条目时"最可提前几日开口"的常规取值：3 个工作日（建条当刻定版写进 amount） */
+    static final int DEFAULT_LEAD_WORKDAYS = 3;
+
+    /** 分不出原委码：日后按原委挑得出一批（public 便于外部按原委筛单/测试核对） */
+    public static final String REASON_DELISTED = "企业已从名录摘走";
+    public static final String REASON_CONTACT_EMPTY = "联络人栏空缺多季未补";
+    public static final String REASON_SCRIPT = "话本缺失或已停用，无本可依";
+    public static final String REASON_QUOTA_FULL = "执法员当日接活定额已满";
+    public static final String REASON_NO_OFFICER = "无在岗且接得动该事由的执法员";
 
     @javax.annotation.Resource
     private TSaltYearTaskMapper saltYearTaskMapper;
@@ -149,6 +153,79 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
     }
 
     @Override
+    public TSaltYearTask createManual(Long siteId, Integer bizType, Date dueAt,
+                                      Integer leadWorkdays, String scriptNo, String content) {
+        if (siteId == null || dueAt == null) {
+            return null;
+        }
+        int biz = bizType == null ? 0 : bizType.intValue();
+
+        // 催办册与年检岗那本（企业总名录）联动：名录里没有或已摘牌的，开不进催办册
+        TSaltEnt ent = this.saltEntMapper.selectOne(new QueryWrapper<TSaltEnt>()
+                .eq("id", siteId).eq("del_flag", 0));
+        if (ent == null || (ent.getStatus() != null && ent.getStatus() != ENT_LISTED)) {
+            return null;
+        }
+        // 话本口径与跑一轮同一把：缺失/停用/事由不对，不予建条
+        if (findUsableScript(scriptNo, biz) == null) {
+            return null;
+        }
+
+        // 同批并着建两回要幂等：同企业+事由+止点视为同一批，只落一条，回的是已在册那条。
+        // 止点按墙钟串绑定（与本类时段比较同一口径，直传 Date 会因 serverTimezone 偏移漏判）。
+        String dueWall = wall(dueAt);
+        TSaltYearTask existing = this.saltYearTaskMapper.selectOne(new QueryWrapper<TSaltYearTask>()
+                .eq("del_flag", 0)
+                .eq("site_id", siteId)
+                .eq("biz_type", biz)
+                .eq("due_at", dueWall)
+                .orderByAsc("id")
+                .last("limit 1"));
+        if (existing != null) {
+            return existing;
+        }
+
+        // "最可提前几日开口"按常规填 3 个工作日；一旦建条即行内定版，
+        // 日后跑轮只认这一行的 amount，不按任何新版常规重算（取舍定死，见 runRound）。
+        int lead = leadWorkdays == null ? DEFAULT_LEAD_WORKDAYS : Math.max(0, leadWorkdays.intValue());
+
+        TSaltYearTask r = new TSaltYearTask();
+        r.setItemNo(generateItemNo(siteId));
+        r.setSiteId(siteId);
+        r.setBizType(biz);
+        r.setDueAt(dueAt);
+        r.setAmount(new BigDecimal(lead));
+        r.setScriptNo(scriptNo);
+        r.setContent(content);
+        r.setStatus(STATUS_WAIT);
+        r.setDelFlag(0);
+        try {
+            this.saltYearTaskMapper.insert(r);
+        } catch (org.springframework.dao.DuplicateKeyException dup) {
+            // 并着两回抢插，库上唯一键 (site_id,biz_type,due_at) 兜底：转取已落的同批那条
+            TSaltYearTask raced = this.saltYearTaskMapper.selectOne(new QueryWrapper<TSaltYearTask>()
+                    .eq("del_flag", 0)
+                    .eq("site_id", siteId)
+                    .eq("biz_type", biz)
+                    .eq("due_at", dueWall)
+                    .orderByAsc("id")
+                    .last("limit 1"));
+            if (raced != null) {
+                return raced;
+            }
+            throw dup;
+        }
+        return r;
+    }
+
+    /** 条目代号：NJ + 建条墙钟（紧凑）+ 企业号，同批幂等由 (企业,事由,止点) 唯一键兜住 */
+    private static String generateItemNo(Long siteId) {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmmss");
+        sdf.setTimeZone(TimeZone.getTimeZone("GMT+8"));
+        return "NJ" + sdf.format(new Date()) + "-" + siteId;
+    }
+
+    @Override
     public SaltYearRoundResult runRound(Date at) {
         Date now = at == null ? new Date() : at;
         LocalDateTime nowLdt = wallLdt(now);
@@ -178,16 +255,19 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
             result.getPickedItemIds().add(r.getId());
         }
 
-        // 二、窗口层：集中办案那几日，手上真有已到档的也不许动，整批压下等下一轮。
+        // 二、窗口层 + 派人：集中办案那几日，手上真有已到档的也不许动，整批压下等下一轮。
+        // 非窗口日每一条都走一遍；一桩走岔不撂下其余，try/catch 兜底逐条办完。
+        // 挑人口径整轮只此一份计划：按执法员的负载与按企业（机构）的归属在这里同源算出，
+        // 同一家企业整轮（乃至往轮已绑过）只黏一位执法员，不会一条路上一个人。
         if (windowDay) {
             for (TSaltYearTask r : picked) {
                 result.getPressedItemIds().add(r.getId());
             }
         } else {
-            // 三、派人：够上的每一条都走一遍；一桩走岔不撂下其余，try/catch 兜底逐条办完。
+            RoundPlan plan = new RoundPlan(nowWall.substring(0, 10));
             for (TSaltYearTask r : picked) {
                 try {
-                    dispatchOne(r, nowWall);
+                    dispatchOne(r, nowWall, plan);
                 } catch (Exception ex) {
                     markFail(r, "本轮派单异常：" + ex.getMessage(), nowWall);
                 }
@@ -220,8 +300,10 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
     /**
      * 一条走一遍：开不成单的当场转挂分不出（摘牌 / 联络人空），
      * 堪派则一处 UPDATE 齐落"情形=已派出、派出那一刻、接活执法员"两个半痕迹。
+     * 挑哪个人只问本轮那一份 {@link RoundPlan}：按执法员分派与按企业（机构）分派
+     * 不再各算各的，同一家企业整轮只黏一位执法员。
      */
-    private void dispatchOne(TSaltYearTask r, String nowWall) {
+    private void dispatchOne(TSaltYearTask r, String nowWall, RoundPlan plan) {
         int bizType = r.getBizType() == null ? 0 : r.getBizType().intValue();
 
         TSaltEnt ent = r.getSiteId() == null ? null : this.saltEntMapper.selectOne(
@@ -235,17 +317,13 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
             return;
         }
 
-        TSaltNotifyScript script = r.getScriptNo() == null ? null : this.saltNotifyScriptMapper.selectOne(
-                new QueryWrapper<TSaltNotifyScript>()
-                        .eq("script_no", r.getScriptNo())
-                        .eq("del_flag", 0)
-                        .eq("status", SCRIPT_ON));
-        if (script == null || (script.getBizType() != null && script.getBizType() != bizType)) {
+        TSaltNotifyScript script = findUsableScript(r.getScriptNo(), bizType);
+        if (script == null) {
             markFail(r, REASON_SCRIPT, nowWall);
             return;
         }
 
-        PickResult pick = chooseOfficer(bizType, nowWall.substring(0, 10));
+        PickResult pick = plan.choose(bizType, r.getSiteId());
         if (pick.officer == null) {
             // 挑不出分两种原委：堪派的全满额 / 压根没有在岗又接得动的（休办、接不动已逐位跳过）
             markFail(r, pick.noneEligible ? REASON_NO_OFFICER : REASON_QUOTA_FULL, nowWall);
@@ -266,43 +344,140 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
         int rows = this.saltYearTaskMapper.update(null, uw);
         if (rows != 1) {
             markFail(r, "派出落痕未齐（更新行数" + rows + "）", nowWall);
+        } else {
+            // 落痕齐了才回记：同轮下一条立刻见得到这份负载与企业归属
+            plan.note(chosen, r.getSiteId());
         }
     }
 
-    /**
-     * 派人一趟挑定：先点当日接得最少的；当日休办的、这一类接不动的逐位跳过；满额的不再落条。
-     * 并列按执法员 id 定序，保证两桩同秒进门派得确定、不吞一桩。
-     * noneEligible=true 表示在岗、接得动该类、今日又不休办的一位都没有。
-     */
-    private PickResult chooseOfficer(int bizType, String today) {
-        List<TSaltOfficer> eligible = eligibleOfficers(bizType, today);
-        PickResult res = new PickResult();
-        if (eligible.isEmpty()) {
-            res.noneEligible = true;
-            return res;
+    /** 话本口径一处定：在场、未删、事由对得上（话本事由空着=两类皆可）；建条目与跑一轮共用 */
+    private TSaltNotifyScript findUsableScript(String scriptNo, int bizType) {
+        if (scriptNo == null || scriptNo.trim().isEmpty()) {
+            return null;
         }
-        Map<Long, Integer> load = todayLoad(today);
-        TSaltOfficer best = null;
-        int bestLoad = Integer.MAX_VALUE;
-        for (TSaltOfficer o : eligible) {
-            int n = load.containsKey(o.getId()) ? load.get(o.getId()) : 0;
-            int limit = o.getDailyLimit() == null ? Integer.MAX_VALUE : o.getDailyLimit().intValue();
-            if (n >= limit) {
-                continue;
-            }
-            if (n < bestLoad || (n == bestLoad && best != null && o.getId() < best.getId())) {
-                best = o;
-                bestLoad = n;
-            }
+        TSaltNotifyScript script = this.saltNotifyScriptMapper.selectOne(
+                new QueryWrapper<TSaltNotifyScript>()
+                        .eq("script_no", scriptNo)
+                        .eq("del_flag", 0)
+                        .eq("status", SCRIPT_ON));
+        if (script == null || (script.getBizType() != null && script.getBizType() != bizType)) {
+            return null;
         }
-        res.officer = best;
-        return res;
+        return script;
     }
 
     /** 派人挑选回话：选中的执法员；一位堪派的都没有时 noneEligible=true */
     private static final class PickResult {
         private TSaltOfficer officer;
         private boolean noneEligible;
+    }
+
+    /**
+     * 本轮分派计划：两条分派路（按执法员负载、按企业归属）只在这一处同源算。
+     *
+     * <ul>
+     *   <li>负载 = 库里今日已接 + 本趟已预留：第一条派出后同轮马上记账，
+     *       不会再把同一家企业当无人接活派给第二个人；</li>
+     *   <li>企业亲和：同一家企业今日已绑过哪位，本趟后续条目仍只给他；
+     *       他满额就按定额挂"分不出"，绝不拆派。</li>
+     * </ul>
+     */
+    private final class RoundPlan {
+        private final String today;
+        /** 每位执法员已预留负载：库里今日已接（底账）+ 本趟已派出 */
+        private final Map<Long, Integer> reserved = new HashMap<Long, Integer>();
+        /** 企业（机构）→ 今日已绑执法员 */
+        private final Map<Long, Long> siteOfficer = new HashMap<Long, Long>();
+        /** 堪派名册按事由缓存一趟 */
+        private final Map<Integer, List<TSaltOfficer>> eligibleCache =
+                new HashMap<Integer, List<TSaltOfficer>>();
+
+        private RoundPlan(String today) {
+            this.today = today;
+            // 底账只点今日已落下的痕：负载与企业归属同源出自这一处
+            for (TSaltYearTask t : todayDispatched(today)) {
+                if (t.getOfficerId() == null) {
+                    continue;
+                }
+                Integer n = this.reserved.get(t.getOfficerId());
+                this.reserved.put(t.getOfficerId(), n == null ? 1 : n + 1);
+                if (t.getSiteId() != null && !this.siteOfficer.containsKey(t.getSiteId())) {
+                    this.siteOfficer.put(t.getSiteId(), t.getOfficerId());
+                }
+            }
+        }
+
+        private PickResult choose(int bizType, Long siteId) {
+            PickResult res = new PickResult();
+            List<TSaltOfficer> eligible = eligible(bizType);
+            if (eligible.isEmpty()) {
+                res.noneEligible = true;
+                return res;
+            }
+
+            // 一、企业亲和优先：这家今日已绑过的人，仍是他接（满额也不拆给第二个人）
+            if (siteId != null && this.siteOfficer.containsKey(siteId)) {
+                TSaltOfficer bound = officerById(this.siteOfficer.get(siteId), eligible);
+                if (bound != null) {
+                    if (hasRoom(bound)) {
+                        res.officer = bound;
+                    }
+                    return res;
+                }
+                // 既定的人今日休办/接不动了：才落到下面当无人兜底另挑，属顶班不是同人撞派
+            }
+
+            // 二、按负载挑：当日接得最少的先点；满额跳过；并列按执法员 id 定序
+            TSaltOfficer best = null;
+            int bestLoad = Integer.MAX_VALUE;
+            for (TSaltOfficer o : eligible) {
+                int n = loadOf(o.getId());
+                if (!hasRoom(o)) {
+                    continue;
+                }
+                if (n < bestLoad || (n == bestLoad && best != null && o.getId() < best.getId())) {
+                    best = o;
+                    bestLoad = n;
+                }
+            }
+            res.officer = best;
+            return res;
+        }
+
+        /** 派出落痕后回记一笔：负载预留 + 企业归属，同轮下一条立刻看得见 */
+        private void note(TSaltOfficer officer, Long siteId) {
+            Integer n = this.reserved.get(officer.getId());
+            this.reserved.put(officer.getId(), n == null ? 1 : n + 1);
+            if (siteId != null) {
+                this.siteOfficer.put(siteId, officer.getId());
+            }
+        }
+
+        private List<TSaltOfficer> eligible(int bizType) {
+            if (!this.eligibleCache.containsKey(bizType)) {
+                this.eligibleCache.put(bizType, eligibleOfficers(bizType, this.today));
+            }
+            return this.eligibleCache.get(bizType);
+        }
+
+        private int loadOf(Long officerId) {
+            Integer n = this.reserved.get(officerId);
+            return n == null ? 0 : n.intValue();
+        }
+
+        private boolean hasRoom(TSaltOfficer o) {
+            int limit = o.getDailyLimit() == null ? Integer.MAX_VALUE : o.getDailyLimit().intValue();
+            return loadOf(o.getId()) < limit;
+        }
+
+        private TSaltOfficer officerById(Long id, List<TSaltOfficer> eligible) {
+            for (TSaltOfficer o : eligible) {
+                if (o.getId().equals(id)) {
+                    return o;
+                }
+            }
+            return null;
+        }
     }
 
     private List<TSaltOfficer> eligibleOfficers(int bizType, String today) {
@@ -329,21 +504,13 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
         return eligible;
     }
 
-    /** 每位执法员当日已接条数（当日派出那一刻落在今日 00:00:00–23:59:59） */
-    private Map<Long, Integer> todayLoad(String today) {
-        List<TSaltYearTask> doneToday = this.saltYearTaskMapper.selectList(new QueryWrapper<TSaltYearTask>()
+    /** 当日已派出条目（派出那一刻落在今日 00:00:00–23:59:59）：负载底账与企业归属同源 */
+    private List<TSaltYearTask> todayDispatched(String today) {
+        return this.saltYearTaskMapper.selectList(new QueryWrapper<TSaltYearTask>()
                 .eq("del_flag", 0)
                 .eq("status", STATUS_DONE)
                 .ge("dispatch_at", today + " 00:00:00")
                 .le("dispatch_at", today + " 23:59:59"));
-        Map<Long, Integer> load = new HashMap<Long, Integer>();
-        for (TSaltYearTask t : doneToday) {
-            if (t.getOfficerId() != null) {
-                Integer n = load.get(t.getOfficerId());
-                load.put(t.getOfficerId(), n == null ? 1 : n + 1);
-            }
-        }
-        return load;
     }
 
     /** 当场转挂分不出：卡住的环与原委写进同一条，日后按原委挑得出一批 */
