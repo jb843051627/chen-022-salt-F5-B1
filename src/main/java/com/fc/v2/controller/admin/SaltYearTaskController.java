@@ -6,7 +6,9 @@ import com.fc.v2.common.base.BaseController;
 import com.fc.v2.common.domain.AjaxResult;
 import com.fc.v2.common.domain.ResultTable;
 import com.fc.v2.common.log.Log;
+import com.fc.v2.model.auto.TSaltYearTask;
 import com.fc.v2.service.ITSaltYearTaskService;
+import com.fc.v2.service.salt.SaltYearCreateResult;
 import com.fc.v2.service.salt.SaltYearRoundResult;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
@@ -51,6 +53,19 @@ public class SaltYearTaskController extends BaseController {
     @ResponseBody
     public ResultTable list() {
         return dataTable(saltYearTaskService.listBoard());
+    }
+
+    @Log(title = "年检催办手动新建", action = "add")
+    @ApiOperation(value = "手动新建一条", notes = "同一批并着建两回只落一回：同批已在册则原样回话，册内既有版本为准；落点与册内条目只取自服务层这一趟")
+    @PostMapping("/add")
+    @RequiresPermissions("saltYearTask:add")
+    @ResponseBody
+    public AjaxResult add(TSaltYearTask record) {
+        SaltYearCreateResult result = saltYearTaskService.createManual(record);
+        if (result.getOutcome() == SaltYearCreateResult.OUT_REJECTED) {
+            return AjaxResult.error(result.getMessage());
+        }
+        return AjaxResult.success(200, result.getMessage(), result);
     }
 
     @Log(title = "年检催办跑一轮", action = "run")

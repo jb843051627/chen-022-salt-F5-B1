@@ -4,10 +4,11 @@ import java.util.Date;
 import java.util.List;
 
 import com.fc.v2.model.auto.TSaltYearTask;
+import com.fc.v2.service.salt.SaltYearCreateResult;
 import com.fc.v2.service.salt.SaltYearRoundResult;
 
 /**
- * 年检到期催办单 Service接口（scheduling-job 形状：周期执行，无增删改查入口）
+ * 年检到期催办单 Service接口（scheduling-job 形状：周期执行；另开手动新建一条的手工入口）
  *
  * @author fuce
  * @date 2026-09-14
@@ -34,4 +35,20 @@ public interface ITSaltYearTaskService {
      * 定时入口与现行屏都只取这一趟的回话。
      */
     SaltYearRoundResult runRound(Date at);
+
+    /**
+     * 手动新建一条年检催办条目（年检岗手工入口）：与催办册同一本，落册即是待派，
+     * 现行屏与下一轮跑一轮照此条走，不另立册。
+     *
+     * 定死的取舍：
+     * 1）同一批（企业 + 事由 + 止点时刻，未删）并着建两回只落一回——第二回原样回话
+     *    册内既有条目，不覆盖、不另建；最可提前几日等一切以册内既有版本为准，
+     *    要改走改单，不靠再建一回；
+     * 2）最可提前几日缺省按 0 填（开口点即止点本身，全省一把尺的缺省口径），
+     *    负数、零头、出格大数一律拒收；
+     * 3）联动两本册在进门处就核：企业须在册（摘牌/查无直接拒收），话本填了须在场
+     *    且对得上事由；话本没填则取该事由唯一在场的一本，取不到唯一就留空，
+     *    跑一轮时按"无本可依"挂分不出（既有设计路径）。
+     */
+    SaltYearCreateResult createManual(TSaltYearTask record);
 }

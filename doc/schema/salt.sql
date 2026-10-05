@@ -188,6 +188,9 @@ CREATE TABLE IF NOT EXISTS t_salt_spot_row (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='抽检结果报送核收行';
 
+-- 同批认定：企业+事由+止点时刻三者全同即同一批。手动新建并着建两回只落一回，
+-- 库层以 uk_salt_year_task_batch 唯一键兜底（服务层先认同批、撞键即回册内既有，册内既有版本为准）。
+-- 本表无删除入口，del_flag 恒 0，唯一键不带删除标记。
 CREATE TABLE IF NOT EXISTS t_salt_year_task (
   id bigint NOT NULL COMMENT '主键',
   item_no varchar(64) DEFAULT NULL COMMENT '年检催办条目代号',
@@ -208,7 +211,8 @@ CREATE TABLE IF NOT EXISTS t_salt_year_task (
   update_time datetime DEFAULT NULL COMMENT '更新时间',
   remark varchar(500) DEFAULT NULL COMMENT '备注',
   PRIMARY KEY (id),
-  KEY idx_salt_year_task_status_due (status, due_at)
+  KEY idx_salt_year_task_status_due (status, due_at),
+  UNIQUE KEY uk_salt_year_task_batch (site_id, biz_type, due_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='年检到期催办单';
 
 -- 初始档案数据（状态约定：id=1 启用 / id=2 停用）

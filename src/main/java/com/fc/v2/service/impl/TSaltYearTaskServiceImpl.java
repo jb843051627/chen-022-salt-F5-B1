@@ -1,6 +1,7 @@
 package com.fc.v2.service.impl;
 
 import java.text.SimpleDateFormat;
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -12,7 +13,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
 
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
@@ -31,8 +34,10 @@ import com.fc.v2.model.auto.TSaltOfficerOff;
 import com.fc.v2.model.auto.TSaltOfficerScope;
 import com.fc.v2.model.auto.TSaltYearTask;
 import com.fc.v2.service.ITSaltYearTaskService;
+import com.fc.v2.service.salt.SaltYearCreateResult;
 import com.fc.v2.service.salt.SaltWorkdayRuler;
 import com.fc.v2.service.salt.SaltYearRoundResult;
+import com.fc.v2.util.StringUtils;
 
 /**
  * 年检到期催办单 Service业务层处理（scheduling-job 形状：周期执行）。
@@ -206,6 +211,150 @@ public class TSaltYearTaskServiceImpl implements ITSaltYearTaskService {
                     + "条，还欠开口" + result.getOwingCount() + "条");
         }
         return result;
+    }
+
+    /**
+     * 手动新建一条：与跑一轮同一本册，落册即待派，现行屏与下一轮照此条走。
+     * 同一批（企业+事由+止点，未删）并着建两回只落一回——第二回原样回话册内既有，
+     * 册内既有版本为准（含最可提前几日），不覆盖、不另建；库层唯一键兜底，
+     * 并着建撞上即回册内既有，不抛不穿。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public SaltYearCreateResult createManual(TSaltYearTask record) {
+        // 一、入门校验：缺值的、出格的当场回话，不落半截册
+        if (record == null) {
+            return SaltYearCreateResult.rejected("空条目不受理");
+        }
+        if (record.getSiteId() == null) {
+            return SaltYearCreateResult.rejected("没拴企业，条目落不了册");
+        }
+        if (record.getDueAt() == null) {
+            return SaltYearCreateResult.rejected("止点时刻空缺，条目落不了册");
+        }
+        int bizType = record.getBizType() == null ? 0 : record.getBizType().intValue();
+        if (bizType != 0 && bizType != 1) {
+            return SaltYearCreateResult.rejected("事由只认 0年检催办 / 1换证提醒");
+        }
+        // 最可提前几日：缺省按 0（开口点即止点本身，尺的缺省口径）；负数、零头、出格大数拒收
+        BigDecimal amount = record.getAmount();
+        if (amount == null) {
+            amount = BigDecimal.ZERO;
+        } else if (amount.signum() < 0 || amount.stripTrailingZeros().scale() > 0
+                || amount.compareTo(new BigDecimal("9999")) > 0) {
+            return SaltYearCreateResult.rejected("最可提前几日按工作日整数填（0–9999），负数、零头、出格大数都不认");
+        }
+
+        // 二、联动名录：企业须在册——摘牌/查无的落进册也只会被跑一轮判分不出，不如进门就拦
+        TSaltEnt ent = this.saltEntMapper.selectOne(new QueryWrapper<TSaltEnt>()
+                .eq("id", record.getSiteId()).eq("del_flag", 0));
+        if (ent == null || (ent.getStatus() != null && ent.getStatus() != ENT_LISTED)) {
+            return SaltYearCreateResult.rejected("企业不在册或已摘牌，条目落不了册");
+        }
+
+        // 三、同批认定：企业+事由+止点（未删）已在册 → 幂等回话，册内既有版本为准，不覆盖、不另建
+        String dueWall = wall(record.getDueAt());
+        TSaltYearTask hit = findBatch(record.getSiteId(), bizType, dueWall);
+        if (hit != null) {
+            return SaltYearCreateResult.existing("同批已在册（条目代号" + hit.getItemNo()
+                    + "），未重复建；最可提前几日等以册内既有版本为准", hit);
+        }
+
+        // 四、条目代号：填了撞车（册内已有同号）拒收；没填照 "NJ+时刻+企业+事由" 起一个
+        String itemNo = record.getItemNo() == null ? null : record.getItemNo().trim();
+        if (itemNo != null && itemNo.isEmpty()) {
+            itemNo = null;
+        }
+        if (itemNo != null) {
+            Integer dup = this.saltYearTaskMapper.selectCount(new QueryWrapper<TSaltYearTask>()
+                    .eq("del_flag", 0).eq("item_no", itemNo));
+            if (dup != null && dup.intValue() > 0) {
+                return SaltYearCreateResult.rejected("条目代号" + itemNo + "册内已有，另换一个");
+            }
+        } else {
+            itemNo = "NJ" + wallCompact(new Date()) + "-" + record.getSiteId() + "-" + bizType;
+        }
+
+        // 五、话本：填了须在场且事由对得上；没填联动话本册取该事由唯一在场的一本，取不到唯一就留空，
+        // 跑一轮时按"无本可依"挂分不出（既有设计路径）
+        String scriptNo = record.getScriptNo() == null ? null : record.getScriptNo().trim();
+        if (scriptNo != null && scriptNo.isEmpty()) {
+            scriptNo = null;
+        }
+        if (scriptNo != null) {
+            TSaltNotifyScript script = this.saltNotifyScriptMapper.selectOne(new QueryWrapper<TSaltNotifyScript>()
+                    .eq("script_no", scriptNo).eq("del_flag", 0).eq("status", SCRIPT_ON));
+            if (script == null || (script.getBizType() != null && script.getBizType().intValue() != bizType)) {
+                return SaltYearCreateResult.rejected("话本" + scriptNo + "不在场或不对该事由，条目落不了册");
+            }
+        } else {
+            scriptNo = theOnlyScriptOn(bizType);
+        }
+
+        // 六、落册：情形=待派、派出痕迹一律空；止点走墙钟串绑定（JDBC 时区不对称，Date 直绑会偏移）
+        TSaltYearTask row = new TSaltYearTask();
+        row.setItemNo(itemNo);
+        row.setSiteId(record.getSiteId());
+        row.setBizType(Integer.valueOf(bizType));
+        row.setAmount(amount);
+        row.setScriptNo(scriptNo);
+        row.setContent(record.getContent());
+        row.setStatus(Integer.valueOf(STATUS_WAIT));
+        row.setDelFlag(Integer.valueOf(0));
+        row.setRemark(record.getRemark());
+        try {
+            this.saltYearTaskMapper.insert(row);
+            this.saltYearTaskMapper.update(null, new UpdateWrapper<TSaltYearTask>()
+                    .eq("id", row.getId())
+                    .set("due_at", dueWall));
+        } catch (DuplicateKeyException dup) {
+            // 并着建撞上库层唯一键：同一批只落一回。本趟若已落了半截（止点尚未回写），
+            // 先清掉再回册内既有——半截条不许留在册里（既有版本为准）
+            if (row.getId() != null) {
+                this.saltYearTaskMapper.deleteById(row.getId());
+            }
+            TSaltYearTask again = findBatch(record.getSiteId(), bizType, dueWall);
+            if (again != null) {
+                return SaltYearCreateResult.existing("同批已在册（条目代号" + again.getItemNo()
+                        + "），未重复建；最可提前几日等以册内既有版本为准", again);
+            }
+            return SaltYearCreateResult.rejected("同批落册撞库层唯一键却查无在册条目，请照库面核对");
+        }
+        row.setDueAt(record.getDueAt());
+        return SaltYearCreateResult.created("新建落册，条目代号" + itemNo + "；情形=待派，下一轮跑一轮照此条走", row);
+    }
+
+    /** 同批回查：企业+事由+止点（未删）；同秒两桩认先落册的（id 最小） */
+    private TSaltYearTask findBatch(Long siteId, int bizType, String dueWall) {
+        List<TSaltYearTask> hits = this.saltYearTaskMapper.selectList(new QueryWrapper<TSaltYearTask>()
+                .eq("del_flag", 0)
+                .eq("site_id", siteId)
+                .eq("biz_type", bizType)
+                .eq("due_at", dueWall)
+                .orderByAsc("id"));
+        return hits.isEmpty() ? null : hits.get(0);
+    }
+
+    /** 该事由唯一在场的话本代号（含"两类皆可"的空事由本）；没有唯一一本则 null，由跑一轮挂起 */
+    private String theOnlyScriptOn(int bizType) {
+        List<TSaltNotifyScript> on = this.saltNotifyScriptMapper.selectList(new QueryWrapper<TSaltNotifyScript>()
+                .eq("del_flag", 0).eq("status", SCRIPT_ON));
+        String only = null;
+        int n = 0;
+        for (TSaltNotifyScript s : on) {
+            if (s.getBizType() == null || s.getBizType().intValue() == bizType) {
+                only = s.getScriptNo();
+                n++;
+            }
+        }
+        return n == 1 ? only : null;
+    }
+
+    /** 条目代号用的紧凑墙钟串（与 wall 同一套 GMT+8 口径） */
+    private static String wallCompact(Date d) {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmmss");
+        sdf.setTimeZone(TimeZone.getTimeZone("GMT+8"));
+        return sdf.format(d);
     }
 
     /** 待派条目：上轮已派出/已判分不出的，本轮不许再当待派捞回来；按止点、id 定序（同秒两桩分两桩） */
